@@ -1,0 +1,27 @@
+# --- ハードウェア制御 ---
+# GPIO制御 (L9110Sなど)
+#gpiozero>=2.0
+# pigpioデーモンとの通信用 (ソフトウェアPWMの負荷回避に必須)
+#pigpio>=1.78
+# I2Cデバイス制御 (PCA9685を使う場合など)
+# adafruit-circuitpython-motorkit
+
+# --- コントローラ入力 ---
+# DualShock 4 の入力を /dev/input/eventX から直接読み取る
+evdev>=1.7.0
+
+# --- Webサーバー & 通信 ---
+# WebRTCシグナリングサーバーおよび操作UI用
+aiohttp>=3.9.0
+# 非同期処理用ユーティリティ
+async-timeout>=4.0
+
+# --- 設定管理 ---
+# コンフィグファイルの読み込み
+PyYAML>=6.0
+
+# --- 映像関連 (Python側で扱う場合のみ) ---
+# ※今回はMediaMTX推奨のため、Pythonで映像を触らないなら不要ですが
+# 将来的にOpenCV等で画像処理をするならコメントアウトを外す
+# opencv-python-headless>=4.8.0
+# av>=10.0.0

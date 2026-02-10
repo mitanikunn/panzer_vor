@@ -1,0 +1,55 @@
+tank_name: "Leopard 2A5 (L9110S)"
+
+drive_system:
+  driver_type: "l9110s" # ドライバの種類を識別
+  
+  # 左モーター設定 (A-IA, A-IB)
+  motor_left:
+    pin_forward: 17
+    pin_backward: 27
+    inverted: false     # 配線逆なら true
+    trim: 1.0
+
+  # 右モーター設定 (B-IA, B-IB)
+  motor_right:
+    pin_forward: 22
+    pin_backward: 23
+    inverted: false
+    trim: 1.0
+    
+  # 物理特性
+  max_speed: 1.0        # 全体の速度制限 (0.0-1.0)
+
+# config.yaml (追記)
+
+turret_system:
+  pan:
+    pin: 12
+    min_angle: -90
+    max_angle: 90
+    initial_angle: 0
+    min_pulse_width: 0.0005   # 500µs
+    max_pulse_width: 0.0025   # 2500µs
+    frame_width: 0.02         # 20ms (50Hz)
+
+  tilt:
+    pin: 13
+    min_angle: -20
+    max_angle: 40
+    initial_angle: 0
+    min_pulse_width: 0.0005
+    max_pulse_width: 0.0024
+    
+  fire:
+    pin: 6
+    recoil_angle: -45  # 引いた状態
+    normal_angle: 0    # 通常状態
+
+
+
+  fire:
+    pin: 6          # リコイル用サーボ
+    led_pin: 5      # マズルフラッシュLED (追加)
+    recoil_angle: -45
+    normal_angle: 0
+    flash_duration: 0.05 # 点灯時間（秒）
