@@ -8,371 +8,299 @@ from drivers.controller import PS4Controller
 from aiohttp import web
 import json
 
-
-# グローバル変数で発砲状態を共有
+# グローバル状態
 GAME_STATE = {
-    "fired": False,      # 主砲 (単発)
-    "machinegun": False, # マシンガン (連射)
+    "fired": False,
+    "machinegun": False,
     "speed": 0.0
 }
 
-# --- カメラ設定 ---
-# rpicam-vidがインストールされているか確認
-CAMERA_CMD = "rpicam-vid"
-
-# MJPEG配信ハンドラ (非同期サブプロセス版)
-# --- 境界検出あり版 (画質安定、遅延小) ---
+# --- Pi Zero W用 軽量MJPEGストリーミング ---
 async def mjpeg_handler(request):
-    boundary = "boundarydonotcross"
-    response = web.StreamResponse(status=200, reason='OK', headers={
-        'Content-Type': 'multipart/x-mixed-replace;boundary={}'.format(boundary),
-        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-    })
+    boundary = "frame"
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            'Content-Type': f'multipart/x-mixed-replace;boundary={boundary}',
+            'Cache-Control': 'no-cache',
+            'Connection': 'close',
+        }
+    )
     await response.prepare(request)
-
+    
+    # 画質設定: 320x240, 10fps, 500kbps
+    cmd = ['raspivid', '-t', '0', '-w', '320', '-h', '240', '-fps', '10', 
+           '-cd', 'MJPEG', '-b', '500000', '-o', '-', '-n']
+    
     proc = await asyncio.create_subprocess_exec(
-        'rpicam-vid', '-t', '0', '--inline', 
-        '--width', '320', '--height', '240', 
-        '--framerate', '20', 
-        '--codec', 'mjpeg', '--quality', '40', '-o', '-',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
     )
 
-    buffer = b""
+    buffer = b''
     try:
         while True:
-            # データ読み込み
             chunk = await proc.stdout.read(4096)
             if not chunk: break
             buffer += chunk
-            
-            # JPEGの終端 (0xFF 0xD9) を探す
-            a = buffer.find(b'\xff\xd8') # Start of Image
-            b = buffer.find(b'\xff\xd9') # End of Image
-            
-            if a != -1 and b != -1:
-                # 1枚の画像が完成
-                jpg = buffer[a:b+2]
-                buffer = buffer[b+2:] # 残りを次へ
-                
-                # 送信
-                await response.write(b'--' + boundary.encode() + b'\r\n')
-                await response.write(b'Content-Type: image/jpeg\r\n')
-                await response.write(b'Content-Length: ' + str(len(jpg)).encode() + b'\r\n\r\n')
-                await response.write(jpg)
-                await response.write(b'\r\n')
-                
-                # バッファが肥大化しないように安全策
-                if len(buffer) > 100000: buffer = b""
 
-    except asyncio.CancelledError:
-        pass
+            while True:
+                start = buffer.find(b'\xff\xd8')
+                end = buffer.find(b'\xff\xd9')
+                if start != -1 and end != -1 and start < end:
+                    jpg = buffer[start:end+2]
+                    buffer = buffer[end+2:]
+                    await response.write(f'--{boundary}\r\n'.encode())
+                    await response.write(b'Content-Type: image/jpeg\r\n')
+                    await response.write(f'Content-Length: {len(jpg)}\r\n\r\n'.encode())
+                    await response.write(jpg)
+                    await response.write(b'\r\n')
+                else:
+                    if len(buffer) > 100000: buffer = b''
+                    break
+    except: pass
     finally:
         if proc.returncode is None:
-            proc.terminate()
-            await proc.wait()
-    
+            try: proc.terminate(); await proc.wait()
+            except: pass
     return response
 
-
-# --- 状態確認API ---
+# --- ステータス配信 ---
 async def status_handler(request):
     global GAME_STATE
-    fired = GAME_STATE["fired"]
-    mg = GAME_STATE["machinegun"]
-    speed = GAME_STATE["speed"]
-    
-    # firedは単発なのでリセット
-    if fired:
-        GAME_STATE["fired"] = False
-        
-    return web.json_response({"fired": fired, "machinegun": mg, "speed": speed})
+    current_state = GAME_STATE.copy()
+    # 発砲フラグは一度送ったら下げる（音の重複防止）
+    if GAME_STATE["fired"]: GAME_STATE["fired"] = False
+    return web.json_response(current_state)
 
-
-# --- HTMLハンドラ (エンジン音制御追加) ---
+# --- Web UI (フル機能版) ---
 async def handle_index(request):
     html = """
+    <!DOCTYPE html>
     <html>
     <head>
-        <title>Panzer Vor!</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Panzer Vor! Mission Control</title>
         <style>
-            body { background: #222; color: #fff; text-align: center; margin: 0; padding: 20px; font-family: sans-serif; }
-            .container { position: relative; display: inline-block; }
-            img { width: 100%; max-width: 640px; border: 2px solid #555; background: #000; }
-            .status { margin-top: 10px; font-size: 1.2em; }
-            #start-btn { 
-                padding: 15px 30px; font-size: 1.5em; background: #d00; color: #fff; 
-                border: none; border-radius: 5px; cursor: pointer; margin-bottom: 20px;
+            body { font-family: 'Courier New', sans-serif; text-align: center; background: #1a1a1a; color: #0f0; margin: 0; }
+            h1 { text-shadow: 0 0 10px #0f0; margin-top: 10px; }
+            .container { 
+                margin: 10px auto; width: 324px; height: 244px; 
+                background: #000; border: 2px solid #555; position: relative;
+                box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
             }
-            /* 音量スライダーのスタイル */
-            .controls { margin: 20px auto; width: 80%; max-width: 400px; }
+            img { width: 320px; height: 240px; object-fit: contain; display: block; margin: 2px; }
+            
+            button { 
+                padding: 10px 30px; font-size: 1.2em; font-weight: bold;
+                background: #c00; color: #fff; border: 2px solid #fff; 
+                cursor: pointer; text-transform: uppercase; letter-spacing: 2px;
+                transition: all 0.3s;
+            }
+            button:hover { background: #f00; box-shadow: 0 0 15px #f00; }
+            button:disabled { background: #333; border-color: #555; color: #888; box-shadow: none; }
+            
+            .controls { width: 300px; margin: 15px auto; text-align: left; background: #222; padding: 10px; border-radius: 5px; }
             input[type=range] { width: 100%; cursor: pointer; }
-            label { font-size: 1.2em; display: block; margin-bottom: 5px; }
+            .status-bar { margin-top: 10px; font-size: 0.9em; color: #888; }
+            .active { color: #0f0; font-weight: bold; }
         </style>
     </head>
     <body>
-        <h1>Panzer Vor! Mission Control</h1>
-        
-        <button id="start-btn" onclick="startSystem()">ENGINE START</button>
-        
-        <div class="controls">
-            <label for="vol-slider">Master Volume: <span id="vol-disp">50%</span></label>
-            <input type="range" id="vol-slider" min="0" max="100" value="50" oninput="updateVolume(this.value)">
-        </div>
+        <h1>PANZER VOR!</h1>
 
         <div class="container">
-            <img id="cam" alt="Camera Stream" />
+            <img id="cam" alt="SYSTEM OFFLINE" />
         </div>
-        <div class="status">Status: <span style="color:#0f0">Online</span></div>
+
+        <button id="start-btn" onclick="startSystem()">ENGINE START</button>
+
+        <div class="controls">
+            <label>MASTER VOLUME: <span id="vol-disp">50%</span></label>
+            <input type="range" min="0" max="100" value="50" oninput="updateVolume(this.value)">
+        </div>
+        
+        <div class="status-bar">
+            SYSTEM STATUS: <span id="sys-status" class="active">STANDBY</span>
+        </div>
 
         <script>
-            // 音声ファイル定義
-            const fireSound = new Audio('/sounds/lepard2a5_fire_01.mp3');
-            const idleSound = new Audio('/sounds/leopard2a5_idring_01.mp3');
-            const driveSound = new Audio('/sounds/leopard2a5_go_01.mp3');
-            const mgSound = new Audio('/sounds/leopard2a5_machinegun_01.mp3');
-            
-            idleSound.loop = true;
-            driveSound.loop = true;
-            mgSound.loop = true;
-            
-            // マスター音量 (0.0 〜 1.0)
-            let masterVolume = 0.5;
-            let pollingInterval = null;
+            // 効果音設定
+            const sounds = {
+                fire: new Audio('/sounds/lepard2a5_fire_01.mp3'),
+                idle: new Audio('/sounds/leopard2a5_idring_01.mp3'),
+                drive: new Audio('/sounds/leopard2a5_go_01.mp3'),
+                mg: new Audio('/sounds/leopard2a5_machinegun_01.mp3')
+            };
 
-            // スライダー操作時に呼ばれる関数
+            sounds.idle.loop = true;
+            sounds.drive.loop = true;
+            sounds.mg.loop = true;
+
+            let masterVol = 0.5;
+            let polling = null;
+
             function updateVolume(val) {
-                masterVolume = val / 100.0;
+                masterVol = val / 100.0;
                 document.getElementById('vol-disp').innerText = val + "%";
-                
-                // 単発系・一定音量の音は即座に反映
-                // エンジン音はcheckStatusループ内で反映されるのでここでは不要だが念のため
-                fireSound.volume = masterVolume;
-                mgSound.volume = masterVolume;
+                sounds.fire.volume = masterVol;
+                sounds.mg.volume = masterVol;
             }
 
             async function startSystem() {
                 const btn = document.getElementById('start-btn');
-                btn.disabled = true;
-                btn.innerText = "Initializing...";
+                btn.disabled = true; btn.innerText = "INITIALIZING...";
 
+                // 音声の事前ロードと再生許可トリガー
                 try {
-                    await initAudio(fireSound);
-                    await initAudio(idleSound);
-                    await initAudio(driveSound);
-                    await initAudio(mgSound);
+                    await Promise.all(Object.values(sounds).map(s => {
+                        return s.play().then(() => { s.pause(); s.currentTime = 0; });
+                    }));
                 } catch (e) {
-                    console.error("Audio init failed:", e);
-                    btn.innerText = "Audio Error (Retry)";
+                    console.error(e);
+                    btn.innerText = "AUDIO ERROR (CLICK TO RETRY)";
                     btn.disabled = false;
                     return;
                 }
 
-                // 始動時はマスター音量を適用
-                idleSound.volume = 1.0 * masterVolume;
-                idleSound.play();
-                driveSound.volume = 0.0;
-                driveSound.play();
+                // エンジン始動
+                sounds.idle.volume = masterVol; sounds.idle.play();
+                sounds.drive.volume = 0; sounds.drive.play();
                 
-                mgSound.pause();
-                mgSound.currentTime = 0;
-
-                document.getElementById('cam').src = "/stream";
+                // カメラ始動 (キャッシュ回避)
+                document.getElementById('cam').src = "/stream?" + Date.now();
+                
                 btn.style.display = 'none';
-
-                if (!pollingInterval) {
-                    pollingInterval = setInterval(checkStatus, 100);
-                }
+                document.getElementById('sys-status').innerText = "ONLINE - COMBAT READY";
+                
+                // ポーリング開始 (Zero負荷軽減のため200ms間隔)
+                if (!polling) polling = setInterval(syncStatus, 200);
             }
 
-            function initAudio(audio) {
-                return new Promise((resolve, reject) => {
-                    audio.onerror = () => reject(new Error(`Failed to load ${audio.src}`));
-                    audio.play().then(() => {
-                        audio.pause();
-                        audio.currentTime = 0;
-                        resolve();
-                    }).catch(err => reject(err));
-                });
-            }
-
-            async function checkStatus() {
+            async function syncStatus() {
                 try {
                     const res = await fetch('/status');
                     const data = await res.json();
-                    
-                    // 1. 主砲
+
+                    // 発砲音
                     if (data.fired) {
-                        fireSound.volume = masterVolume; // 発射時に音量適用
-                        fireSound.currentTime = 0;
-                        fireSound.play().catch(e => {});
+                        sounds.fire.currentTime = 0;
+                        sounds.fire.play().catch(()=>{});
                     }
-                    
-                    // 2. マシンガン
+
+                    // マシンガン
                     if (data.machinegun) {
-                        mgSound.volume = masterVolume; // 連射中も音量適用
-                        if (mgSound.paused) {
-                            mgSound.play().catch(e => {});
-                        }
+                        if (sounds.mg.paused) sounds.mg.play().catch(()=>{});
                     } else {
-                        if (!mgSound.paused) {
-                            mgSound.pause();
-                            mgSound.currentTime = 0;
-                        }
+                        sounds.mg.pause(); sounds.mg.currentTime = 0;
                     }
 
-                    // 3. エンジン音 (クロスフェード x マスター音量)
-                    const speed = data.speed;
-                    
-                    // 本来のバランス計算 (0.0〜1.0)
-                    const baseIdleVol = Math.max(0, 1.0 - (speed * 1.5)); 
-                    const baseDriveVol = Math.min(1.0, speed * 1.2); 
-                    
-                    // マスター音量を掛ける
-                    const finalIdleVol = baseIdleVol * masterVolume;
-                    const finalDriveVol = baseDriveVol * masterVolume;
+                    // エンジン音のクロスフェード
+                    const spd = data.speed;
+                    const idleVol = Math.max(0, 1.0 - (spd * 1.5)) * masterVol;
+                    const driveVol = Math.min(1.0, spd * 1.2) * masterVol;
 
-                    // ピッチ
-                    const idleRate = 1.0 + (speed * 0.2);
-                    const driveRate = 0.8 + (speed * 0.8);
+                    // ピッチ変化
+                    sounds.idle.playbackRate = 1.0 + (spd * 0.2);
+                    sounds.drive.playbackRate = 0.8 + (spd * 0.8);
 
-                    // スムージング適用
-                    idleSound.volume = clamp(idleSound.volume + (finalIdleVol - idleSound.volume) * 0.2);
-                    driveSound.volume = clamp(driveSound.volume + (finalDriveVol - driveSound.volume) * 0.2);
-                    
-                    idleSound.playbackRate = idleRate;
-                    driveSound.playbackRate = driveRate;
+                    // 音量適用 (簡易的なスムージング)
+                    sounds.idle.volume = sounds.idle.volume * 0.8 + idleVol * 0.2;
+                    sounds.drive.volume = sounds.drive.volume * 0.8 + driveVol * 0.2;
 
                 } catch (e) {}
             }
-
-            function clamp(val) { return Math.max(0, Math.min(1.0, val)); }
         </script>
     </body>
     </html>
     """
     return web.Response(text=html, content_type='text/html')
 
-
-
+# --- 制御ループ (砲塔・走行) ---
+async def control_loop(tank, turret, controller):
+    print("Control Logic Started")
+    pan_angle = 0
+    tilt_angle = 0
     
+    while True:
+        try:
+            if not controller.state:
+                await asyncio.sleep(0.1)
+                continue
 
-async def start_web_server():
+            # 1. 走行制御
+            thr = controller.state.get('throttle', 0)
+            trn = controller.state.get('turn', 0)
+            tank.drive(thr, trn)
+            GAME_STATE["speed"] = max(abs(thr), abs(trn))
+
+            # 2. 砲塔制御 (相対移動 & 制限)
+            # 右スティック入力を取得
+            t_pan = controller.state.get('turret_pan', 0)   # 左右
+            t_tilt = controller.state.get('turret_tilt', 0) # 上下
+
+            if abs(t_pan) > 0.1 or abs(t_tilt) > 0.1:
+                # 入力がある場合だけ角度を更新 (感度調整: *3, *2)
+                pan_angle += t_pan * 3.0
+                tilt_angle += t_tilt * 2.0
+                
+                # 角度制限 (サーボの限界に合わせて調整してください)
+                pan_angle = max(-90, min(90, pan_angle))
+                tilt_angle = max(-20, min(40, tilt_angle))
+                
+                turret.set_turret(pan_angle, tilt_angle)
+
+            # 3. 武装制御
+            # L2ボタンで機銃
+            l2 = controller.state.get('l2', -1.0)
+            GAME_STATE["machinegun"] = (l2 > 0.1)
+
+            # R2または特定ボタンで主砲
+            if controller.state.get('fire'):
+                GAME_STATE["fired"] = True
+                asyncio.create_task(turret.fire_gun())
+                controller.state['fire'] = False
+
+            await asyncio.sleep(0.05) # 20Hz制御
+            
+        except Exception as e:
+            print(f"Ctrl Error: {e}")
+            await asyncio.sleep(1)
+
+# --- メインエントリ ---
+async def main():
+    # 設定読み込み
+    config = {}
+    if os.path.exists("config/config.yaml"):
+        with open("config/config.yaml") as f: config = yaml.safe_load(f)
+
+    # ハードウェア初期化
+    tank = TankDriveSystem()
+    turret = TurretController(config.get('turret_system', {}))
+    controller = PS4Controller()
+
+    # Webサーバーセットアップ
     app = web.Application()
     app.router.add_get('/', handle_index)
     app.router.add_get('/stream', mjpeg_handler)
     app.router.add_get('/status', status_handler)
+    
+    # 重要: 音声ファイルへのパスを通す
+    # soundsフォルダがないとブラウザで404エラーになります
     app.router.add_static('/sounds/', path='./sounds/', name='sounds')
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
-    print("Web Server started at http://0.0.0.0:8080")
+    await web.TCPSite(runner, '0.0.0.0', 8080).start()
+    print("=== Panzer Vor! System Online ===")
+    print("Access: http://<IP>:8080")
 
-
-
-
-
-
-async def tank_control_loop(tank, turret, controller):
-    global GAME_STATE
-    print("Control Loop Started")
-    pan_angle = 0
-    tilt_angle = 0
-    
-    try:
-        while True:
-            if not hasattr(controller, 'state'):
-                await asyncio.sleep(1)
-                continue
-
-            # 入力読み取り
-            # L2ボタンの値 (0.0 〜 1.0) を取得。0.5以上でONとみなす
-            l2_val = controller.state.get('l2', -1.0) # 初期値-1.0等
-            # ps4 controllerライブラリによってはL2は -1.0(離)〜1.0(押) だったり 0.0(離)〜1.0(押) だったりする
-            # ここでは「0.0より大きい」または「特定ボタン」として判定
-            
-            # もし `controller.state` に `l2` がアナログ値で入っているなら：
-            is_machinegun = (l2_val > 0.1) # 少しでも押したらON
-            
-            # あるいは `buttons` に入っているなら：
-            # is_machinegun = controller.state['buttons']['l2'] 
-            
-            GAME_STATE["machinegun"] = is_machinegun
-
-            # 走行・主砲
-            throttle = controller.state.get('throttle', 0)
-            turn = controller.state.get('turn', 0)
-            GAME_STATE["speed"] = max(abs(throttle), abs(turn))
-            tank.drive(throttle, turn)
-            
-            t_pan = controller.state.get('turret_pan', 0)
-            t_tilt = controller.state.get('turret_tilt', 0)
-            if t_pan != 0: pan_angle = max(min(pan_angle + t_pan*3, 90), -90)
-            if t_tilt != 0: tilt_angle = max(min(tilt_angle + t_tilt*2, 40), -20)
-            turret.set_turret(pan_angle, tilt_angle)
-            
-            if controller.state.get('fire', False):
-                GAME_STATE["fired"] = True
-                asyncio.create_task(turret.fire_gun())
-                controller.state['fire'] = False
-            
-            await asyncio.sleep(0.05)
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        tank.stop()
-
-
-
-
-
-async def main():
-    # コンフィグ読み込み
-    config_path = "config/config.yaml"
-    if not os.path.exists(config_path):
-        print(f"Error: {config_path} not found.")
-        # デフォルト値で続行する場合のフォールバックなどを入れても良い
-        sys.exit(1)
-
-    try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-    except Exception as e:
-        print(f"Config load error: {e}")
-        sys.exit(1)
-
-    print("Initializing Hardware...")
-    try:
-        tank = TankDriveSystem()
-        # configからturret_systemを取得、なければ空辞書
-        turret = TurretController(config.get('turret_system', {}))
-    except Exception as e:
-        print(f"Hardware Init Failed: {e}")
-        sys.exit(1)
-    
-    ps4 = PS4Controller()
-    
-    print("System Ready. Press Ctrl+C to stop.")
-
-    # タスク生成
-    input_task = asyncio.create_task(ps4.listen())
-    control_task = asyncio.create_task(tank_control_loop(tank, turret, ps4))
-    web_task = asyncio.create_task(start_web_server())
-    
-    try:
-        # 全タスクを並列実行
-        await asyncio.gather(input_task, control_task, web_task)
-    except asyncio.CancelledError:
-        print("Main cancelled.")
-    finally:
-        print("Shutting down...")
-        tank.stop()
+    # 全タスク並列実行
+    await asyncio.gather(
+        controller.listen(),
+        control_loop(tank, turret, controller)
+    )
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\nMission Aborted.")

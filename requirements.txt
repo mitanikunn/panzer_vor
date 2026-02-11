@@ -5,6 +5,7 @@
 #pigpio>=1.78
 # I2Cデバイス制御 (PCA9685を使う場合など)
 # adafruit-circuitpython-motorkit
+gpiozero
 
 # --- コントローラ入力 ---
 # DualShock 4 の入力を /dev/input/eventX から直接読み取る
